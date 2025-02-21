@@ -21,7 +21,7 @@ from langchain_google_community.gmail.utils import (
     get_gmail_credentials,
 )
 from langgraph.graph import StateGraph
-from langgraph.types import interrupt, Command
+from langgraph.types import interrupt
 
 from agent.configuration import Configuration
 from agent.state import State, EmailInfo
@@ -111,7 +111,7 @@ async def retrieve_emails(state: State, config: RunnableConfig) -> Dict[str, Any
                 body = _extract_email_body(message_data)
                 
                 # Check if sender is in priority list
-                sender = message_data.get('sender', '')
+                sender = message_data.get('sender', '(Unknown)')
                 is_priority = any(priority_sender in sender.lower() 
                                     for priority_sender in configuration.priority_senders)
                 
@@ -146,26 +146,8 @@ async def retrieve_emails(state: State, config: RunnableConfig) -> Dict[str, Any
 def _extract_email_body(message_data):
     """Extract plaintext email body from message data."""
     body = ""
-    
-    # Handle different possible message structures
-    try:
-        # Check if the message has a 'body' field directly (in case of different API response format)
-        if 'body' in message_data:
-            return message_data.get('body', '')
-            
-        if 'snippet' in message_data:
-            # Use snippet as fallback
-            body = message_data.get('snippet', '')
-                 
-    except Exception as e:
-        logger.error(f"Error extracting email body: {str(e)}")
-        # If we encountered an error, return snippet or empty string
-        if 'snippet' in message_data:
-            return message_data['snippet']
-            
-    if not body and 'snippet' in message_data:
-        return message_data['snippet']
-            
+    if 'body' in message_data: body = message_data['body']   
+    elif 'snippet' in message_data: body = message_data['snippet']
     return body.strip()
 
 async def prioritize_emails(state: State, config: RunnableConfig) -> Dict[str, Any]:
@@ -215,7 +197,7 @@ async def prioritize_emails(state: State, config: RunnableConfig) -> Dict[str, A
             SUBJECT: {email.subject}
             DATE: {email.date}
             BODY:
-            {email.body[:1000]}...
+            {email.body[:2000]}...
             """
             
             try:
@@ -249,17 +231,7 @@ async def prioritize_emails(state: State, config: RunnableConfig) -> Dict[str, A
                 email.priority_score = result.get("priority_score", 5)
                 email.ask_user = result.get("ask_user", True)
                 email.reasoning = result.get("reasoning", "")
-                
-                # Fix empty response options issue
-                proposed_options = result.get("proposed_response_options", [])
-                if not proposed_options or len(proposed_options) == 0:
-                    proposed_options = [
-                        "Acknowledge receipt", 
-                        "No response needed",
-                        "Forward if relevant"
-                    ]
-                
-                email.proposed_response_options = proposed_options
+                email.proposed_response_options = result.get("proposed_response_options", [])
                 
             except Exception as e:
                 logger.error(f"Error prioritizing email: {str(e)}", exc_info=True)

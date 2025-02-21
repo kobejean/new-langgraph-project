@@ -163,3 +163,4 @@ cython_debug/
 uv.lock
 .webui_secret_key
 token.json
+token*.json
