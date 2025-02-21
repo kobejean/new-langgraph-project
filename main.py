@@ -14,7 +14,14 @@ from dataclasses import fields, asdict
 from pprint import pprint
 
 from langchain_core.runnables import RunnableConfig
-from agent.graph import graph
+# Import functions directly from graph.py
+from agent.graph import (
+    initialize_resources, 
+    retrieve_emails, 
+    prioritize_emails, 
+    generate_response, 
+    create_draft
+)
 from agent.state import State, EmailInfo
 
 # Set up logging
@@ -41,6 +48,11 @@ async def get_user_decision(email_details: Dict[str, Any]) -> Optional[str]:
     print(f"Subject: {email_details['subject']}")
     print(f"Priority: {email_details['priority_score']}/10")
     print(f"Analysis: {email_details['reasoning']}")
+    
+    # Show email preview if available
+    if 'body_preview' in email_details:
+        print(f"\nPreview: {email_details['body_preview']}")
+        
     print("\nResponse Options:")
     
     if not email_details['response_options'] or len(email_details['response_options']) == 0:
@@ -78,15 +90,10 @@ async def run_assistant(config: RunnableConfig):
     Args:
         config: Configuration for the assistant
     """
-    # Create a config with a high recursion limit
-    execution_config = {
-        "recursion_limit": 1000,
-        "configurable": config.get("configurable", {})
-    }
+    # Set up the Gmail assistant without relying on LangGraph checkpointing
+    thread_id = os.environ.get("THREAD_ID", f"gmail-assistant-{os.getpid()}")
     
-    # Initialize (only once)
-    logger.info("Starting workflow...")
-    initial_state = State()
+    logger.info(f"Starting workflow with thread ID: {thread_id}")
     
     # Skip initialization if specified (for debugging)
     if os.environ.get("SKIP_INIT") == "1":
@@ -97,125 +104,99 @@ async def run_assistant(config: RunnableConfig):
                 emails = []
                 for email_dict in state_dict.get("emails", []):
                     emails.append(EmailInfo(**email_dict))
-                current_state = State(**{k: v for k, v in state_dict.items() if k != "emails"})
-                current_state.emails = emails
+                state = State(**{k: v for k, v in state_dict.items() if k != "emails"})
+                state.emails = emails
                 logger.info(f"Loaded cached state with {len(emails)} emails")
         except (FileNotFoundError, json.JSONDecodeError) as e:
             logger.warning(f"Could not load cached state: {e}")
-            current_state = initial_state
+            state = State()
     else:
-        # Do one-time initialization
-        try:
-            logger.info("Initializing resources and retrieving emails...")
-            # We'll do these steps manually to avoid repeating them
-            init_result = await graph.ainvoke(initial_state, config=execution_config)
-            
-            if 'emails' not in init_result or not init_result['emails']:
-                logger.warning("No emails found to process")
-                return
-                
-            # Extract fields from initialization
-            valid_state_fields = {f.name for f in fields(State)}
-            state_dict = {k: v for k, v in init_result.items() if k in valid_state_fields}
-            current_state = State(**state_dict)
-            
-            # Cache state for future runs if needed
-            try:
-                # Convert state to dict for serialization, handling EmailInfo objects
-                state_to_save = {
-                    k: v for k, v in state_dict.items() if k != "emails"
-                }
-                if 'emails' in state_dict:
-                    state_to_save['emails'] = [asdict(email) for email in state_dict['emails']]
-                
-                with open("cached_state.json", "w") as f:
-                    json.dump(state_to_save, f)
-                    logger.info("Cached state for future runs")
-            except Exception as e:
-                logger.warning(f"Could not cache state: {e}")
-                
-        except Exception as e:
-            logger.error(f"Error during initialization: {str(e)}", exc_info=True)
-            return
+        state = State()
     
-    # Track our progress
+    # Track progress
     total_processed = 0
-    total_drafts = 0
     
-    # Process each email one by one
     try:
-        finished = False
-        while not finished and current_state.current_email_index < len(current_state.emails):
-            # Start processing from current email
-            current_email = current_state.get_current_email()
+        # Initialize resources and retrieve emails first
+        logger.info("Initializing resources...")
+        resources_result = await initialize_resources(state, config)
+        
+        # Update state with returned values
+        for key, value in resources_result.items():
+            setattr(state, key, value)
+        
+        if not state.tools:
+            logger.error("Failed to initialize resources")
+            return
+            
+        logger.info("Retrieving emails...")
+        emails_result = await retrieve_emails(state, config)
+        
+        # Update state with returned values
+        for key, value in emails_result.items():
+            setattr(state, key, value)
+        
+        if not state.emails:
+            logger.info("No emails to process")
+            return
+            
+        logger.info("Prioritizing emails...")
+        prioritize_result = await prioritize_emails(state, config)
+        
+        # Update state with returned values
+        for key, value in prioritize_result.items():
+            setattr(state, key, value)
+        
+        # Process emails one by one with human decisions
+        while state.current_email_index < len(state.emails):
+            current_email = state.get_current_email()
             if not current_email:
-                logger.info("No more emails to process")
                 break
                 
-            logger.info(f"Processing email {current_state.current_email_index + 1}/{len(current_state.emails)}: {current_email.subject}")
+            logger.info(f"Processing email {state.current_email_index + 1}/{len(state.emails)}: {current_email.subject}")
+            logger.info(f"{current_email.ask_user} {current_email.selected_option}")
             
-            # Decision processing
-            if current_email.requires_decision and not current_email.selected_option:
-                # Check if user has already made a decision
-                if current_email.message_id in current_state.user_decisions:
-                    # Apply user decision
-                    decision = current_state.user_decisions[current_email.message_id]
-                    logger.info(f"Using previous decision: {decision}")
+            if current_email.ask_user and not current_email.selected_option:
+                # Prepare email details for human review
+                email_details = {
+                    "message_id": current_email.message_id,
+                    "subject": current_email.subject,
+                    "sender": current_email.sender,
+                    "priority_score": current_email.priority_score,
+                    "reasoning": current_email.reasoning,
+                    "response_options": current_email.proposed_response_options,
+                    "body_preview": current_email.body[:500] + ("..." if len(current_email.body) > 500 else "")
+                }
+                
+                # Get human decision
+                logger.info(f"Requesting user decision for email: {current_email.subject}")
+                decision = await get_user_decision(email_details)
+                
+                if decision:
+                    logger.info(f"User selected: {decision}")
+                    # Update the email with the selected option
                     current_email.selected_option = decision
-                    current_state.emails[current_state.current_email_index] = current_email
+                    state.emails[state.current_email_index] = current_email
+                    
+                    # Generate response
+                    logger.info(f"Generating response...")
+                    response_result = await generate_response(state, config)
+                    for key, value in response_result.items():
+                        setattr(state, key, value)
+                    
+                    # Create draft
+                    logger.info(f"Creating draft...")
+                    draft_result = await create_draft(state, config)
+                    for key, value in draft_result.items():
+                        setattr(state, key, value)
+                    
+                    total_processed += 1
                 else:
-                    # Create human feedback request
-                    email_details = {
-                        "message_id": current_email.message_id,
-                        "subject": current_email.subject,
-                        "sender": current_email.sender,
-                        "priority_score": current_email.priority_score,
-                        "reasoning": current_email.reasoning,
-                        "response_options": current_email.proposed_response_options
-                    }
-                    
-                    # Get user decision
-                    logger.info(f"Requesting user decision for email: {current_email.subject}")
-                    decision = await get_user_decision(email_details)
-                    
-                    if decision:
-                        logger.info(f"User selected: {decision}")
-                        # Update user decisions dictionary
-                        current_state.user_decisions[current_email.message_id] = decision
-                        # Update the email object
-                        current_email.selected_option = decision
-                        current_state.emails[current_state.current_email_index] = current_email
-                    else:
-                        logger.info(f"User skipped email: {current_email.subject}")
-                        # Move to next email
-                        current_state.current_email_index += 1
-                        continue
+                    logger.info(f"User skipped email: {current_email.subject}")
             
-            # If email requires decision but has no options, skip it
-            if current_email.requires_decision and not current_email.proposed_response_options:
-                logger.warning(f"Email requires decision but has no options: {current_email.subject}")
-                current_state.current_email_index += 1
-                continue
-                
-            # Process the current email (generate response and create draft)
-            if current_email.selected_option and not current_email.generated_response:
-                # Generate response
-                current_state.next = "generate_response"
-                result = await graph.ainvoke(current_state, config=execution_config)
-                
-                # Update state with new info
-                if 'emails' in result:
-                    current_state.emails = result['emails']
-                if 'total_drafts_created' in result:
-                    current_state.total_drafts_created = result['total_drafts_created']
-                    total_drafts = result['total_drafts_created']
-                    
             # Move to next email
-            logger.info(f"Finished processing email: {current_email.subject}")
-            current_state.current_email_index += 1
-            
-        logger.info("Email processing complete")
-            
+            state.current_email_index += 1
+    
     except KeyboardInterrupt:
         logger.info("Operation cancelled by user")
     except Exception as e:
@@ -223,9 +204,6 @@ async def run_assistant(config: RunnableConfig):
     
     # Print final results
     print("\n=== Processing Complete ===")
-    total_drafts = current_state.total_drafts_created
-    print(f"Total emails processed: {current_state.current_email_index}")
-    print(f"Total drafts created: {total_drafts}")
 
 
 def main():

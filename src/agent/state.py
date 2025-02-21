@@ -18,7 +18,7 @@ class EmailInfo:
     date: str
     body: str
     priority_score: Optional[int] = None
-    requires_decision: bool = True
+    ask_user: bool = True
     reasoning: str = ""
     proposed_response_options: List[str] = field(default_factory=list)
     selected_option: Optional[str] = None
@@ -40,13 +40,9 @@ class State:
     
     # Workflow control
     next: str = "generate_response"  # Controls the next state in the workflow
-    wait_counter: int = 0  # Counter to prevent infinite waiting
     
-    # API resources
-    api_resource: Any = None
-    toolkit: Any = None
     tools: List[Any] = field(default_factory=list)
-    
+
     # Processing status
     emails_retrieved: bool = False
     emails_prioritized: bool = False
@@ -56,10 +52,6 @@ class State:
     
     # User decisions
     user_decisions: Dict[str, str] = field(default_factory=dict)
-    
-    # Stats and metrics
-    total_emails_processed: int = 0
-    total_drafts_created: int = 0
     
     # Additional fields for LangGraph interaction
     human_feedback_needed: Dict[str, Any] = field(default_factory=dict)
@@ -95,9 +87,20 @@ class State:
     
     def get_emails_requiring_decisions(self) -> List[EmailInfo]:
         """Get emails that require user decisions."""
-        return [email for email in self.emails if email.requires_decision]
+        return [email for email in self.emails if email.ask_user]
         
     def __setattr__(self, name, value):
         """Allow setting arbitrary attributes on the state object."""
         # This makes the state object more flexible for LangGraph integration
         object.__setattr__(self, name, value)
+        
+    def to_dict(self):
+        """Convert state to a serializable dictionary, excluding non-serializable fields."""
+        return {
+            "emails": [email.__dict__ for email in self.emails],
+            "current_email_index": self.current_email_index,
+            "next": self.next,
+            "errors": self.errors,
+            "user_decisions": self.user_decisions,
+            "human_feedback_needed": self.human_feedback_needed
+        }
