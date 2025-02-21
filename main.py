@@ -223,8 +223,6 @@ async def run_assistant(config: RunnableConfig):
     
     # Print final results
     print("\n=== Processing Complete ===")
-    if hasattr(current_state, 'total_emails_processed'):
-        total_processed = current_state.total_emails_processed
     total_drafts = current_state.total_drafts_created
     print(f"Total emails processed: {current_state.current_email_index}")
     print(f"Total drafts created: {total_drafts}")
@@ -236,7 +234,7 @@ def main():
     config = {
         "configurable": {
             "model_name": "llama3",
-            "days_back": 3,
+            "days_back": 4,
             "max_emails": 10,
             "response_style": "professional",
             "include_signature": True,

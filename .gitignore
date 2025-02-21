@@ -162,3 +162,4 @@ cython_debug/
 #.idea/
 uv.lock
 .webui_secret_key
+token.json
